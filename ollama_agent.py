@@ -1,13 +1,13 @@
 """
 Agentic AI Orchestrator — Tool-Calling Agent via Local Ollama
 =============================================================
-Uses LangChain's `create_react_agent` (dev-agents style) with a local
-Ollama model that supports function/tool calling (e.g. llama3.2, mistral-nemo,
-qwen2.5, or any model with `tools` support listed by `ollama list`).
+Uses LangGraph's `create_react_agent` with a local Ollama model that supports
+function/tool calling (e.g. llama3.2, mistral-nemo, qwen2.5, or any model
+with `tools` support listed by `ollama list`).
 
 Prerequisites
 -------------
-pip install langchain langchain-ollama langchain-community
+pip install langchain langchain-core langchain-ollama langgraph langgraph-prebuilt
 
 Ensure Ollama is running:
   ollama serve
@@ -24,19 +24,17 @@ Run:
 import math
 import datetime
 import json
-from typing import Annotated
 
 from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from langchain.agents import AgentExecutor, create_react_agent
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.prebuilt import create_react_agent
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = "llama3.2"   # Change to any Ollama model with tool-calling support
+MODEL_NAME = "minimax-m2.5:cloud"   # Change to any Ollama model with tool-calling support
 OLLAMA_BASE_URL = "http://localhost:11434"
 
 # ---------------------------------------------------------------------------
@@ -113,14 +111,28 @@ def word_counter(text: str) -> str:
 
 
 @tool
+def to_json(expression: str) -> str:
+    """
+    Convert a given expression to JSON format.
+
+    Args:
+        expression: The expression to convert.
+
+    Returns:
+        A JSON string with the expression.
+    """
+    return json.dumps(expression)
+
+
+@tool
 def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
     """
     Convert a value between common units.
 
     Supported conversions:
-      - Temperature : celsius  ↔ fahrenheit ↔ kelvin
-      - Length      : meters   ↔ feet ↔ inches ↔ kilometers ↔ miles
-      - Weight      : kg       ↔ pounds ↔ grams ↔ ounces
+      - Temperature : celsius  <-> fahrenheit <-> kelvin
+      - Length      : meters   <-> feet <-> inches <-> kilometers <-> miles
+      - Weight      : kg       <-> pounds <-> grams <-> ounces
 
     Args:
         value     : Numeric value to convert.
@@ -165,26 +177,26 @@ def unit_converter(value: float, from_unit: str, to_unit: str) -> str:
         result = value * to_kg[from_unit] / to_kg[to_unit]
         return f"{round(result, 6)} {to_unit}"
 
-    return f"Unsupported conversion: {from_unit} → {to_unit}"
+    return f"Unsupported conversion: {from_unit} -> {to_unit}"
 
 
 # ---------------------------------------------------------------------------
 # All registered tools
 # ---------------------------------------------------------------------------
 
-TOOLS = [calculator, get_current_datetime, word_counter, unit_converter]
+TOOLS = [calculator, get_current_datetime, word_counter, unit_converter, to_json]
 
 
 # ---------------------------------------------------------------------------
 # Agent Factory
 # ---------------------------------------------------------------------------
 
-def build_agent() -> AgentExecutor:
+def build_agent():
     """
-    Build a LangChain ReAct agent backed by a local Ollama model.
+    Build a LangGraph ReAct agent backed by a local Ollama model.
 
-    The agent uses `bind_tools` so the model can emit structured tool-call
-    requests, which `AgentExecutor` intercepts and routes to the right function.
+    Uses langgraph.prebuilt.create_react_agent (compatible with LangChain v1.x
+    / LangGraph v1.x where AgentExecutor has been removed).
     """
     llm = ChatOllama(
         model=MODEL_NAME,
@@ -192,49 +204,26 @@ def build_agent() -> AgentExecutor:
         temperature=0,          # deterministic for tool-use tasks
     )
 
-    # Bind tools so the LLM knows their signatures
-    llm_with_tools = llm.bind_tools(TOOLS)
-
-    # ReAct-style prompt expected by create_react_agent
-    prompt = ChatPromptTemplate.from_messages([
-        (
-            "system",
-            (
-                "You are a helpful AI assistant with access to the following tools:\n\n"
-                "{tools}\n\n"
-                "Use the following format:\n\n"
-                "Question: the input question you must answer\n"
-                "Thought: you should always think about what to do\n"
-                "Action: the action to take, should be one of [{tool_names}]\n"
-                "Action Input: the input to the action\n"
-                "Observation: the result of the action\n"
-                "... (this Thought/Action/Action Input/Observation can repeat N times)\n"
-                "Thought: I now know the final answer\n"
-                "Final Answer: the final answer to the original input question"
-            ),
-        ),
-        MessagesPlaceholder(variable_name="chat_history", optional=True),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-
-    agent = create_react_agent(llm=llm_with_tools, tools=TOOLS, prompt=prompt)
-
-    return AgentExecutor(
-        agent=agent,
+    # create_react_agent from langgraph.prebuilt automatically handles the
+    # tool-calling loop — no need for AgentExecutor or a manual prompt.
+    agent = create_react_agent(
+        model=llm,
         tools=TOOLS,
-        verbose=True,           # prints thought/action/observation loop
-        handle_parsing_errors=True,
-        max_iterations=8,
+        prompt=(
+            "You are a helpful AI assistant with access to tools. "
+            "Use them whenever they help you answer accurately."
+        ),
     )
+
+    return agent
 
 
 # ---------------------------------------------------------------------------
 # Interactive Chat Loop
 # ---------------------------------------------------------------------------
 
-def run_chat_loop(agent_executor: AgentExecutor) -> None:
-    """Simple REPL that feeds user messages into the agent."""
+def run_chat_loop(agent) -> None:
+    """Simple REPL that feeds user messages into the LangGraph agent."""
     chat_history: list = []
 
     print("\n" + "=" * 60)
@@ -261,18 +250,24 @@ def run_chat_loop(agent_executor: AgentExecutor) -> None:
         if not user_input:
             continue
 
+        # Append user message to history
+        chat_history.append(HumanMessage(content=user_input))
+
         try:
-            response = agent_executor.invoke(
-                {
-                    "input": user_input,
-                    "chat_history": chat_history,
-                }
-            )
-            answer = response.get("output", "")
+            # LangGraph agents accept {"messages": [...]}
+            result = agent.invoke({"messages": chat_history})
+
+            # The final assistant message is the last AIMessage in the list
+            messages = result.get("messages", [])
+            answer = ""
+            for msg in reversed(messages):
+                if isinstance(msg, AIMessage) and msg.content:
+                    answer = msg.content if isinstance(msg.content, str) else str(msg.content)
+                    break
+
             print(f"\nAgent: {answer}\n")
 
-            # Maintain conversation history
-            chat_history.append(HumanMessage(content=user_input))
+            # Keep history so the agent has conversation context
             chat_history.append(AIMessage(content=answer))
 
         except Exception as exc:
@@ -284,5 +279,5 @@ def run_chat_loop(agent_executor: AgentExecutor) -> None:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    agent_executor = build_agent()
-    run_chat_loop(agent_executor)
+    agent = build_agent()
+    run_chat_loop(agent)
